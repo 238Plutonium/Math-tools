@@ -1,0 +1,635 @@
+/*
+ * mycord client - Part 3 (TUI Masterclass with Bell & Robust Resize Handling)
+ * Implements a Text User Interface with history scrolling, fixed input, status bars,
+ * audible alerts for mentions, and robust terminal resize handling (SIGWINCH).
+ */
+
+#include <stdbool.h>
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <string.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <time.h>
+#include <pthread.h>
+#include <signal.h>
+#include <ctype.h>
+#include <stdint.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+
+// --- Protocol Definitions ---
+
+enum MessageType {
+    MSG_LOGIN        = 0,
+    MSG_LOGOUT       = 1,
+    MSG_MESSAGE_SEND = 2,
+    MSG_MESSAGE_RECV = 10,
+    MSG_DISCONNECT   = 12,
+    MSG_SYSTEM       = 13
+};
+
+struct __attribute__((packed)) Message {
+    uint32_t type, timestamp;
+    char username[32], message[1024];
+};
+typedef struct Message message_t;
+
+// --- Global Settings & TUI State ---
+
+#define MAX_HISTORY 2000
+#define MAX_INPUT 1023
+
+typedef struct Settings {
+    struct sockaddr_in server;
+    bool quiet;
+    bool use_tui;        // TUI Flag
+    int socket_fd;
+    bool running;
+    char username[32];
+    char *input_line;    // Buffer for non-TUI getline
+} settings_t;
+
+typedef struct TUIState {
+    char *history[MAX_HISTORY];
+    int history_count;
+    int scroll_offset;          // 0 = at bottom (newest), >0 = scrolled up
+    char input_buffer[MAX_INPUT + 1];
+    int input_len;
+    pthread_mutex_t lock;
+    struct termios orig_termios;
+    struct winsize ws;
+} tui_state_t;
+
+// GLOBAL VARIABLES
+static settings_t settings = {0};
+static tui_state_t tui = {0};
+// Flag to signal that the TUI needs a redraw due to a resize (SIGWINCH)
+volatile sig_atomic_t needs_redraw = 0; 
+
+
+// ANSI Colors
+static const char* COLOR_RED    = "\033[31m";
+static const char* COLOR_GRAY   = "\033[90m";
+static const char* COLOR_RESET  = "\033[0m";
+
+// Forward Declarations
+static int resolve_address(const char *host, const char *ip, bool is_domain);
+static bool validate_string(bool is_message, const char *str);
+static void display_message(const char *username, const char *message, uint32_t timestamp);
+static int send_message(int type, const char *username, const char *message);
+void redraw_tui();
+
+// --- TUI Helper Functions ---
+
+void disable_raw_mode() {
+    if (settings.use_tui) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &tui.orig_termios);
+        printf("\033[?25h"); // Show cursor
+    }
+}
+
+void enable_raw_mode() {
+    if (!settings.use_tui) return;
+    
+    tcgetattr(STDIN_FILENO, &tui.orig_termios);
+    atexit(disable_raw_mode);
+    
+    struct termios raw = tui.orig_termios;
+    // Disable Echo, Canonical mode, Signals, Extended input
+    raw.c_lflag &= ~(ECHO | ICANON | ISIG | IEXTEN);
+    // Disable flow control
+    raw.c_iflag &= ~(IXON | ICRNL);
+    // Raw output
+    raw.c_oflag &= ~(OPOST);
+    
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    printf("\033[?25l"); // Hide cursor
+}
+
+// --- Signal Handler ---
+
+void handle_signal(int signal) {
+    if (signal == SIGWINCH) {
+        // Set flag to trigger redraw in the main loop
+        needs_redraw = 1;
+    } else {
+        // Handle SIGINT, SIGTERM
+        settings.running = false;
+        if (!settings.use_tui) {
+            // Unblock getline in standard mode
+            close(STDIN_FILENO);
+        }
+    }
+}
+
+// --- Utility Functions (Part 1 & 2 Logic) ---
+
+int process_args(int argc, char *argv[]) {
+    const char *ip = "127.0.0.1";
+    const char *domain = NULL;
+    int port = 8080;
+    bool has_ip = false, has_domain = false;
+    
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        
+        if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
+            printf("mycord client\n\noptions:\n");
+            printf("  --help                show help\n");
+            printf("  --port PORT           port (default: 8080)\n");
+            printf("  --ip IP               IP (default: 127.0.0.1)\n");
+            printf("  --domain DOMAIN       Domain name\n");
+            printf("  --quiet               disable highlighting\n");
+            printf("  --tui                 enable Text User Interface\n");
+            exit(0);
+        }
+        else if (!strcmp(arg, "--port")) {
+            if (++i >= argc) { fprintf(stderr, "Error: --port value missing\n"); return -1; }
+            port = atoi(argv[i]);
+            if (port <= 0 || port > 65535) { fprintf(stderr, "Error: invalid port\n"); return -1; }
+        }
+        else if (!strcmp(arg, "--ip")) {
+            if (++i >= argc) { fprintf(stderr, "Error: missing ip\n"); return -1; }
+            has_ip = true; ip = argv[i];
+        }
+        else if (!strcmp(arg, "--domain")) {
+            if (++i >= argc) { fprintf(stderr, "Error: missing domain\n"); return -1; }
+            has_domain = true; domain = argv[i];
+        }
+        else if (!strcmp(arg, "--quiet")) {
+            settings.quiet = true;
+        }
+        else if (!strcmp(arg, "--tui")) {
+            settings.use_tui = true;
+        }
+        else {
+            fprintf(stderr, "Error: unknown arg \"%s\"\n", arg);
+            return -1;
+        }
+    }
+    
+    if (has_domain && has_ip) {
+        fprintf(stderr, "Error: ip and domain both present\n");
+        return -1;
+    }
+    
+    settings.server.sin_family = AF_INET;
+    settings.server.sin_port = htons(port);
+    
+    return resolve_address(domain, ip, has_domain);
+}
+
+static int resolve_address(const char *host, const char *ip, bool is_domain) {
+    if (is_domain) {
+        struct hostent *hostent = gethostbyname(host);
+        if (hostent && hostent->h_addr_list[0]) {
+            memcpy(&settings.server.sin_addr, hostent->h_addr_list[0], hostent->h_length);
+            return 0;
+        } else {
+            fprintf(stderr, "Error: cannot resolve host\n");
+            return -1;
+        }
+    }
+    if (inet_pton(AF_INET, ip, &settings.server.sin_addr) != 1) {
+        fprintf(stderr, "Error: invalid ipv4 addr\n");
+        return -1;
+    }
+    return 0;
+}
+
+static bool validate_string(bool is_message, const char *str) {
+    for (const unsigned char *p = (const unsigned char *)str; *p; p++) {
+        if (is_message ? !isprint(*p) : !isalnum(*p)) return false;
+    }
+    return true;
+}
+
+int get_username() {
+    char buffer[64] = {0};
+    FILE *fp = popen("whoami", "r");
+    if (!fp || fgets(buffer, sizeof(buffer), fp) == NULL) {
+        if (fp) pclose(fp);
+        fprintf(stderr, "Error: cannot retrieve username\n");
+        return -1;
+    }
+    pclose(fp);
+    size_t len = strlen(buffer);
+    if (len > 0 && buffer[len - 1] == '\n') buffer[len - 1] = '\0';
+    if (strlen(buffer) == 0 || !validate_string(false, buffer)) {
+        fprintf(stderr, "Error: invalid username\n");
+        return -1;
+    }
+    strcpy(settings.username, buffer);
+    return 0;
+}
+
+ssize_t perform_full_read(void *buf, size_t n) {
+    char *data = (char *)buf;
+    size_t received = 0;
+    while (received < n) {
+        ssize_t bytes = read(settings.socket_fd, data + received, n - received);
+        if (bytes > 0) { received += bytes; continue; }
+        if (!settings.running || bytes == 0) return -1;
+        if (errno == EINTR) continue;
+        return -1;
+    }
+    return received;
+}
+
+static ssize_t perform_full_write(const void *buf, size_t n) {
+    const char *data = (const char *)buf;
+    size_t written = 0;
+    while (written < n) {
+        ssize_t bytes = write(settings.socket_fd, data + written, n - written);
+        if (bytes > 0) { written += bytes; continue; }
+        if (!settings.running) return -1;
+        if (errno == EINTR) continue;
+        return -1;
+    }
+    return written;
+}
+
+static int send_message(int type, const char *username, const char *message) {
+    message_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = htonl(type);
+    msg.timestamp = htonl(time(NULL));
+    if (username) strncpy(msg.username, username, sizeof(msg.username) - 1);
+    if (message) strncpy(msg.message, message, sizeof(msg.message) - 1);
+    return (perform_full_write(&msg, sizeof(msg)) == sizeof(msg)) ? 0 : -1;
+}
+
+// --- TUI Logic ---
+
+void tui_add_to_history(char *formatted_msg) {
+    pthread_mutex_lock(&tui.lock);
+    
+    if (tui.history_count == MAX_HISTORY) {
+        free(tui.history[0]);
+        memmove(&tui.history[0], &tui.history[1], (MAX_HISTORY - 1) * sizeof(char*));
+        tui.history_count--;
+    }
+    
+    tui.history[tui.history_count++] = formatted_msg;
+    
+    if (tui.scroll_offset == 0) {
+        tui.scroll_offset = 0; // Snap to newest
+    }
+    
+    if (settings.use_tui) redraw_tui();
+    pthread_mutex_unlock(&tui.lock);
+}
+
+void redraw_tui() {
+    if (!settings.running) return;
+
+    // Get the LATEST window size immediately before drawing
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &tui.ws) == -1) {
+        tui.ws.ws_col = 80; tui.ws.ws_row = 24;
+    }
+
+    size_t buf_size = tui.ws.ws_col * tui.ws.ws_row * 2 + 4096;
+    char *frame_buf = malloc(buf_size); 
+    if (!frame_buf) return;
+    int pos = 0;
+
+    // --- 1. Clear & Header ---
+    pos += sprintf(frame_buf + pos, "\033[2J\033[H");
+    
+    char header_text[256];
+    snprintf(header_text, sizeof(header_text), " MyCord | User: %s | Server: %s:%d ", 
+             settings.username, inet_ntoa(settings.server.sin_addr), ntohs(settings.server.sin_port));
+    
+    // Inverted Header
+    pos += sprintf(frame_buf + pos, "\033[7m"); 
+    int pad = (tui.ws.ws_col - strlen(header_text)) / 2;
+    if (pad < 0) pad = 0;
+    for(int i=0; i<pad; i++) pos += sprintf(frame_buf + pos, " ");
+    pos += sprintf(frame_buf + pos, "%s", header_text);
+    for(int i=0; i<tui.ws.ws_col - pad - strlen(header_text); i++) pos += sprintf(frame_buf + pos, " ");
+    pos += sprintf(frame_buf + pos, "\033[27m\r\n");
+
+    // --- 2. Messages ---
+    int msg_area_height = tui.ws.ws_row - 3;
+    if (msg_area_height < 0) msg_area_height = 0;
+
+    int start_index = tui.history_count - msg_area_height - tui.scroll_offset;
+    if (start_index < 0) start_index = 0;
+    
+    int end_index = tui.history_count - tui.scroll_offset;
+    if (end_index > tui.history_count) end_index = tui.history_count;
+    if (end_index < 0) end_index = 0;
+
+    for (int i = start_index; i < end_index; i++) {
+        pos += sprintf(frame_buf + pos, "%s\r\n", tui.history[i]);
+    }
+
+    // --- 3. Separator ---
+    // Move cursor to the row before last
+    pos += sprintf(frame_buf + pos, "\033[%d;0H", tui.ws.ws_row - 1);
+    pos += sprintf(frame_buf + pos, "\033[90m");
+    for (int i = 0; i < tui.ws.ws_col; i++) pos += sprintf(frame_buf + pos, "-");
+    pos += sprintf(frame_buf + pos, "\033[0m");
+
+    // --- 4. Input (FIXED: Added Truncation to Prevent Line Wrap) ---
+    
+    // Move cursor to the last row (bottom)
+    pos += sprintf(frame_buf + pos, "\033[%d;0H", tui.ws.ws_row);
+    
+    // Calculate space for input: column width minus prompt (> ) and cursor placeholder (_)
+    // This ensures the displayed input buffer will fit on a single line.
+    int max_input_display_len = tui.ws.ws_col - 3; 
+    if (max_input_display_len < 0) max_input_display_len = 0;
+
+    // Print the prompt
+    pos += sprintf(frame_buf + pos, "\033[1m> \033[0m");
+
+    // Print the input buffer, truncating its display length to prevent wrap.
+    pos += sprintf(frame_buf + pos, "%.*s", 
+                   max_input_display_len, 
+                   tui.input_buffer);
+
+    // Print the blinking cursor placeholder immediately after the displayed text
+    pos += sprintf(frame_buf + pos, "\033[5m_\033[25m"); 
+
+    write(STDOUT_FILENO, frame_buf, pos);
+    free(frame_buf);
+}
+
+// Display function
+static void display_message(const char *username, const char *message, uint32_t timestamp) {
+    if (!username) username = "(null)";
+    if (!message) message = "(null)";
+    
+    time_t time_val = timestamp;
+    char time_str[32];
+    strftime(time_str, sizeof(time_str), "%H:%M", localtime(&time_val));
+    
+    char *final_str = malloc(2048);
+    if (!final_str) return;
+    
+    int name_hash = 0;
+    for (int i=0; username[i]; i++) name_hash += username[i];
+    int color_code = 31 + (name_hash % 6);
+    
+    bool mentioned = false;
+
+    if (settings.quiet) {
+        sprintf(final_str, "[%s] %s: %s", time_str, username, message);
+    } else {
+        char mention[33];
+        snprintf(mention, sizeof(mention), "@%s", settings.username);
+        
+        char *ptr = final_str;
+        
+        if (settings.use_tui) {
+            ptr += sprintf(ptr, "%s[%s]%s \033[%dm%s\033[0m: ", 
+                           COLOR_GRAY, time_str, COLOR_RESET, color_code, username);
+        } else {
+            strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", localtime(&time_val));
+            ptr += sprintf(ptr, "[%s] %s: ", time_str, username);
+        }
+        
+        const char *current = message;
+        const char *found;
+        size_t mention_len = strlen(mention);
+        
+        while ((found = strstr(current, mention)) != NULL) {
+            strncat(ptr, current, found - current);
+            ptr += (found - current);
+            
+            if (settings.use_tui) {
+                ptr += sprintf(ptr, "\033[1;41;37m%s\033[0m", mention);
+                mentioned = true;
+            } else {
+                ptr += sprintf(ptr, "\a%s%s%s", COLOR_RED, mention, COLOR_RESET);
+            }
+            
+            current = found + mention_len;
+        }
+        strcpy(ptr, current);
+    }
+
+    if (settings.use_tui) {
+        // Ring bell once immediately if mentioned
+        if (mentioned) {
+            write(STDOUT_FILENO, "\a", 1);
+        }
+        tui_add_to_history(final_str);
+    } else {
+        printf("%s\n", final_str);
+        fflush(stdout);
+        free(final_str);
+    }
+}
+
+// Thread function
+void* receive_messages_thread(void* arg) {
+    (void)arg;
+    message_t msg;
+    
+    while (settings.running && perform_full_read(&msg, sizeof(msg)) >= 0) {
+        uint32_t type = ntohl(msg.type);
+        uint32_t timestamp = ntohl(msg.timestamp);
+        
+        if (type == MSG_MESSAGE_RECV) {
+            display_message(msg.username, msg.message, timestamp);
+        }
+        else if (type == MSG_SYSTEM || type == MSG_DISCONNECT) {
+            char *str = malloc(1200);
+            const char *color = (type == MSG_DISCONNECT) ? COLOR_RED : COLOR_GRAY;
+            const char *label = (type == MSG_DISCONNECT) ? "DISCONNECT" : "SYSTEM";
+            
+            if (settings.use_tui) {
+                 sprintf(str, "%s*** %s: %s ***%s", color, label, msg.message, COLOR_RESET);
+            } else {
+                 sprintf(str, "%s[%s] %s%s", color, label, msg.message, COLOR_RESET);
+            }
+            
+            if (settings.use_tui) {
+                tui_add_to_history(str);
+            } else {
+                printf("%s\n", str);
+                fflush(stdout);
+                free(str);
+            }
+            
+            if (type == MSG_DISCONNECT) {
+                settings.running = false;
+                if (!settings.use_tui) {
+                    if (settings.input_line) free(settings.input_line);
+                    close(settings.socket_fd);
+                    close(STDIN_FILENO);
+                    exit(0);
+                }
+            }
+        }
+    }
+    settings.running = false;
+    return NULL;
+}
+
+bool txvalid(const char *msg) {
+    if (!msg || strlen(msg) < 1 || strlen(msg) > 1023) return false;
+    return validate_string(true, msg);
+}
+
+void tui_loop() {
+    char c;
+    while (settings.running) {
+        // Read is blocking, but can be interrupted by a signal (like SIGWINCH)
+        ssize_t bytes_read = read(STDIN_FILENO, &c, 1);
+        
+        // --- Signal/Resize Handling ---
+        if (bytes_read == -1 && errno == EINTR) {
+            if (!settings.running) break;
+
+            if (needs_redraw) {
+                pthread_mutex_lock(&tui.lock);
+                needs_redraw = 0; // Clear flag
+                redraw_tui();     // Force redraw with new dimensions
+                pthread_mutex_unlock(&tui.lock);
+            }
+            continue;
+        } 
+        
+        // --- Input Handling ---
+        if (bytes_read == 1) {
+            pthread_mutex_lock(&tui.lock);
+            
+            if (c == 127 || c == '\b') { // Backspace
+                if (tui.input_len > 0) {
+                    tui.input_buffer[--tui.input_len] = '\0';
+                }
+            }
+            else if (c == '\n' || c == '\r') { // Enter
+                if (tui.input_len > 0) {
+                    if (txvalid(tui.input_buffer)) {
+                        send_message(MSG_MESSAGE_SEND, NULL, tui.input_buffer);
+                    }
+                    tui.input_buffer[0] = '\0';
+                    tui.input_len = 0;
+                    tui.scroll_offset = 0; // Snap to bottom
+                }
+            }
+            else if (c == '\x1b') { // Arrows
+                char seq[3];
+                // Read next two bytes to check for ANSI escape sequence (e.g., [A, [B)
+                if (read(STDIN_FILENO, &seq[0], 1) == 1 && read(STDIN_FILENO, &seq[1], 1) == 1) {
+                    if (seq[0] == '[') {
+                        if (seq[1] == 'A') { // UP Arrow
+                            tui.scroll_offset++;
+                            int msg_area = tui.ws.ws_row - 3;
+                            // Clamp scroll offset at max history viewable area
+                            if (tui.scroll_offset > tui.history_count - msg_area) 
+                                tui.scroll_offset = tui.history_count - msg_area;
+                            if (tui.scroll_offset < 0) tui.scroll_offset = 0;
+                        } 
+                        else if (seq[1] == 'B') { // DOWN Arrow
+                            tui.scroll_offset--;
+                            if (tui.scroll_offset < 0) tui.scroll_offset = 0;
+                        }
+                    }
+                }
+            }
+            else if (c == '\x03' || c == '\x04') { // Ctrl+C/D
+                settings.running = false;
+            }
+            else if (isprint(c)) {
+                if (tui.input_len < MAX_INPUT) {
+                    tui.input_buffer[tui.input_len++] = c;
+                    tui.input_buffer[tui.input_len] = '\0';
+                }
+            }
+            
+            redraw_tui();
+            pthread_mutex_unlock(&tui.lock);
+        } else if (bytes_read == -1) {
+            // Unhandled error
+            if (errno != EINTR && errno != EAGAIN) break;
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_signal;
+    sigemptyset(&sa.sa_mask);
+    
+    // Register SIGINT, SIGTERM, and SIGWINCH
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGWINCH, &sa, NULL); 
+    
+    if (process_args(argc, argv) != 0 || get_username() != 0) exit(1);
+    
+    // --- TUI INITIALIZATION MOVED UP ---
+    if (settings.use_tui) {
+        pthread_mutex_init(&tui.lock, NULL);
+        ioctl(STDOUT_FILENO, TIOCGWINSZ, &tui.ws);
+        enable_raw_mode();
+        
+        // FIX: Force clear screen to prevent previous terminal output from showing
+        write(STDOUT_FILENO, "\033[2J\033[H", 6);
+    }
+    // ------------------------------------
+    
+    settings.socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (settings.socket_fd < 0) { perror("Error: socket"); exit(1); }
+    
+    if (connect(settings.socket_fd, (struct sockaddr*)&settings.server, sizeof(settings.server)) < 0) {
+        perror("Error: connect"); close(settings.socket_fd); exit(1);
+    }
+    
+    settings.running = true;
+    send_message(MSG_LOGIN, settings.username, NULL);
+    
+    // Thread created AFTER TUI setup
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, receive_messages_thread, NULL) != 0) {
+        perror("Error: thread"); close(settings.socket_fd); exit(1);
+    }
+    
+    if (settings.use_tui) {
+        redraw_tui(); 
+        tui_loop();
+        disable_raw_mode();
+    } else {
+        char *line = NULL;
+        size_t line_size = 0;
+        settings.input_line = line;
+        
+        while (settings.running) {
+            ssize_t read = getline(&line, &line_size, stdin);
+            settings.input_line = line;
+            if (read < 0) break;
+            
+            while (read > 0 && (line[read - 1] == '\n' || line[read - 1] == '\r')) 
+                line[--read] = '\0';
+            
+            if (line && txvalid(line)) {
+                if (send_message(MSG_MESSAGE_SEND, NULL, line) < 0) settings.running = false;
+            } else if (line && strlen(line) > 0) {
+                 fprintf(stderr, "Error: invalid message\n");
+            }
+        }
+        free(line);
+    }
+    
+    send_message(MSG_LOGOUT, NULL, NULL);
+    settings.running = false;
+    shutdown(settings.socket_fd, SHUT_RDWR);
+    close(settings.socket_fd);
+    pthread_join(thread, NULL);
+    if (settings.use_tui) {
+        pthread_mutex_destroy(&tui.lock);
+    }
+    
+    for (int i = 0; i < tui.history_count; i++) free(tui.history[i]);
+    
+    return 0;
+}
